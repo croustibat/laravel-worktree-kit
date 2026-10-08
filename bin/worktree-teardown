@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# laravel-worktree-kit — undo what worktree-setup created.
+#
+# Run it from inside the worktree, BEFORE the worktree itself is removed.
+# Best-effort by design: every step can fail without blocking the removal,
+# because a worktree you cannot delete is worse than a site left registered.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+WTK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$WTK_DIR/lib/common.sh"
+
+wtk_detect_host
+main_root="$(wtk_main_root)"
+wtk_assert_not_main_checkout "$main_root"
+wtk_load_config "$main_root"
+
+workspace="$(wtk_workspace_name)"
+repo="$(basename "$main_root")"
+site_name="$(wtk_slug "${repo}-${workspace}")"
+db_name="$(wtk_ident "${repo}_${workspace}")"
+
+# A name that came out empty would make the next lines operate on something
+# else entirely. Stop rather than guess.
+if [ -z "$workspace" ] || [ -z "$site_name" ] || [ -z "$db_name" ]; then
+    wtk_warn "Empty workspace name — cleanup cancelled."
+    exit 0
+fi
+
+wtk_say "🧹 cleaning ${site_name}"
+
+type wtk_before_teardown >/dev/null 2>&1 && wtk_before_teardown
+
+# --- 1. Site --------------------------------------------------------------
+site_tool="${WTK_SITE_TOOL:-auto}"
+if [ "$site_tool" = auto ]; then
+    if   command -v herd  >/dev/null 2>&1; then site_tool=herd
+    elif command -v valet >/dev/null 2>&1; then site_tool=valet
+    else site_tool=none
+    fi
+fi
+if [ "$site_tool" != none ]; then
+    "$site_tool" unsecure  "$site_name" >/dev/null 2>&1 || true
+    "$site_tool" unisolate "$site_name" >/dev/null 2>&1 || true
+    "$site_tool" unlink    "$site_name" >/dev/null 2>&1 || true
+fi
+
+# --- 2. Database ----------------------------------------------------------
+db_port_arg=""
+case "$WTK_DB_DRIVER" in
+    pgsql)
+        [ -n "$WTK_DB_PORT" ] && db_port_arg="-p $WTK_DB_PORT"
+        # --force (PostgreSQL 13+) drops live connections — queue workers and
+        # websocket servers hold one open long after the agent has stopped.
+        # shellcheck disable=SC2086
+        dropdb -U "$WTK_DB_USER" -h "$WTK_DB_HOST" $db_port_arg \
+            --if-exists --force "$db_name" || true
+        ;;
+    mysql|mariadb)
+        [ -n "$WTK_DB_PORT" ] && db_port_arg="-P $WTK_DB_PORT"
+        # shellcheck disable=SC2086
+        mysql -u "$WTK_DB_USER" -h "$WTK_DB_HOST" $db_port_arg \
+            -e "DROP DATABASE IF EXISTS \`${db_name}\`" || true
+        ;;
+    sqlite|none) : ;;  # the file leaves with the worktree
+esac
+
+# --- 3. Reload the site tool so its config forgets the site ---------------
+[ "$site_tool" != none ] && { "$site_tool" restart >/dev/null 2>&1 || true; }
+
+type wtk_after_teardown >/dev/null 2>&1 && wtk_after_teardown
+
+wtk_say "✅ removed site ${site_name} and database ${db_name}"
+exit 0

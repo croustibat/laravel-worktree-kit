@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# laravel-worktree-kit — make a freshly created git worktree bootable.
+#
+# Creates: a site in Herd/Valet, a database of its own, a block of ports of
+# its own, a derived .env, installed dependencies, a migrated schema.
+#
+# Run it from inside the new worktree. Safe to re-run.
+# ---------------------------------------------------------------------------
+set -euo pipefail
+
+WTK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/common.sh
+. "$WTK_DIR/lib/common.sh"
+
+wtk_detect_host
+main_root="$(wtk_main_root)"
+wtk_assert_not_main_checkout "$main_root"
+wtk_load_config "$main_root"
+
+workspace="$(wtk_workspace_name)"
+repo="$(basename "$main_root")"
+site_name="$(wtk_slug "${repo}-${workspace}")"
+db_name="$(wtk_ident "${repo}_${workspace}")"
+slot="$(wtk_port_slot "$site_name")"
+domain="${site_name}.${WTK_SITE_TLD:-test}"
+
+wtk_say "▸ host=${WTK_HOST}  worktree=${workspace}  slot=${slot}"
+
+type wtk_before >/dev/null 2>&1 && wtk_before
+
+# --- 1. Files the main checkout has and git does not carry -----------------
+for f in $WTK_COPY_FILES; do
+    if [ -f "$main_root/$f" ]; then
+        cp "$main_root/$f" "$f"
+    elif [ "$f" = ".env" ] && [ -f .env.example ]; then
+        cp .env.example .env
+    fi
+done
+[ -f .env ] || wtk_die "No .env and no .env.example — nothing to derive from."
+
+# --- 2. Identity of this worktree ------------------------------------------
+wtk_set_env APP_URL "https://${domain}"
+
+case "$WTK_DB_DRIVER" in
+    pgsql|mysql|mariadb)
+        wtk_set_env DB_DATABASE "$db_name"
+        [ -n "$WTK_DB_PORT" ] && wtk_set_env DB_PORT "$WTK_DB_PORT"
+        ;;
+    sqlite)
+        wtk_set_env DB_CONNECTION sqlite
+        wtk_set_env DB_DATABASE "$(pwd)/database/database.sqlite"
+        ;;
+esac
+
+# Ports. Every key in a group gets the SAME port: a server port and the
+# client-side port the browser dials must match, or the websocket silently
+# connects to the wrong worktree.
+for group in $WTK_PORT_SERVICES; do
+    index="${group%%:*}"
+    keys="${group#*:}"
+    port="$(wtk_port "$slot" "$index")"
+    old_ifs="$IFS"; IFS=','
+    for key in $keys; do wtk_set_env "$key" "$port"; done
+    IFS="$old_ifs"
+done
+
+# Forced values. Several agents working in parallel must not send real mail,
+# hit a production bucket, or report to a shared error tracker.
+for pair in $WTK_FORCE_ENV; do
+    wtk_set_env "${pair%%=*}" "${pair#*=}"
+done
+
+# --- 3. Site ---------------------------------------------------------------
+site_tool="${WTK_SITE_TOOL:-auto}"
+if [ "$site_tool" = auto ]; then
+    if   command -v herd  >/dev/null 2>&1; then site_tool=herd
+    elif command -v valet >/dev/null 2>&1; then site_tool=valet
+    else site_tool=none
+    fi
+fi
+case "$site_tool" in
+    herd|valet)
+        "$site_tool" link "$site_name"
+        [ -n "$WTK_PHP_VERSION" ] && "$site_tool" isolate "$WTK_PHP_VERSION" --site="$site_name"
+        [ "$WTK_SECURE" = 1 ] && "$site_tool" secure "$site_name"
+        "$site_tool" restart >/dev/null 2>&1 || true
+        ;;
+    none) wtk_warn "No Herd or Valet found — skipping site registration." ;;
+esac
+
+# --- 4. Database -----------------------------------------------------------
+db_port_arg=""
+case "$WTK_DB_DRIVER" in
+    pgsql)
+        [ -n "$WTK_DB_PORT" ] && db_port_arg="-p $WTK_DB_PORT"
+        # shellcheck disable=SC2086
+        createdb -U "$WTK_DB_USER" -h "$WTK_DB_HOST" $db_port_arg "$db_name" 2>/dev/null \
+            || wtk_say "   database ${db_name} already exists"
+        ;;
+    mysql|mariadb)
+        [ -n "$WTK_DB_PORT" ] && db_port_arg="-P $WTK_DB_PORT"
+        # shellcheck disable=SC2086
+        mysql -u "$WTK_DB_USER" -h "$WTK_DB_HOST" $db_port_arg \
+            -e "CREATE DATABASE IF NOT EXISTS \`${db_name}\`" \
+            || wtk_warn "Could not create ${db_name}."
+        ;;
+    sqlite) mkdir -p database && : > database/database.sqlite ;;
+    none)   : ;;
+esac
+
+# --- 5. PHP dependencies ---------------------------------------------------
+composer_cmd="composer"
+[ "$site_tool" = herd ] && composer_cmd="herd composer"
+type wtk_before_composer >/dev/null 2>&1 && wtk_before_composer "$composer_cmd"
+$composer_cmd install --no-interaction --prefer-dist --optimize-autoloader
+
+# --- 6. Laravel ------------------------------------------------------------
+php artisan config:clear >/dev/null
+php artisan key:generate --force --no-interaction >/dev/null
+if [ "$WTK_DB_DRIVER" != none ]; then
+    if [ "$WTK_SEED" = 1 ]; then
+        php artisan migrate --seed --force
+    else
+        php artisan migrate --force
+    fi
+fi
+php artisan storage:link >/dev/null 2>&1 || true
+
+# --- 7. Front-end ----------------------------------------------------------
+if [ -f package.json ] && [ "$WTK_BUILD" = 1 ]; then
+    pm="$WTK_PACKAGE_MANAGER"
+    if [ "$pm" = auto ]; then
+        if   [ -f yarn.lock ];         then pm=yarn
+        elif [ -f pnpm-lock.yaml ];    then pm=pnpm
+        elif [ -f bun.lockb ];         then pm=bun
+        else                                pm=npm
+        fi
+    fi
+    case "$pm" in
+        npm) npm install && npm run build ;;
+        *)   "$pm" install && "$pm" run build ;;
+    esac
+fi
+
+type wtk_after >/dev/null 2>&1 && wtk_after
+
+# --- 8. What you got -------------------------------------------------------
+wtk_say ""
+wtk_say "✅ ${workspace} is ready"
+wtk_say "   site  https://${domain}"
+[ "$WTK_DB_DRIVER" != none ] && wtk_say "   db    ${db_name}"
+for group in $WTK_PORT_SERVICES; do
+    wtk_say "   port  $(wtk_port "$slot" "${group%%:*}")  →  ${group#*:}"
+done
+wtk_say ""
