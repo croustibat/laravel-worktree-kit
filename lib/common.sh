@@ -66,6 +66,23 @@ wtk_slug() {
         | sed 's#-\{2,\}#-#g; s#^-##; s#-$##'
 }
 
+# Site name for <repo> + <workspace>, at most WTK_SITE_MAX_LEN (58) characters.
+# `herd secure` puts the domain in the certificate CN, capped at 64: past that
+# it writes the .key without the .crt, and the orphan nginx config then stops
+# nginx from starting — every .test site goes down. A name that is too long is
+# cut and suffixed with a hash of the workspace, so it stays unique and stable.
+wtk_site_name() {
+    local repo="$1" workspace="$2" name hash keep
+    local max="${WTK_SITE_MAX_LEN:-58}"
+    name="$(wtk_slug "${repo}-${workspace}")"
+    if [ "${#name}" -gt "$max" ]; then
+        hash="$(printf '%s' "$workspace" | cksum | awk '{print $1}')"
+        keep=$(( max - ${#hash} - 1 ))
+        name="$(printf '%s' "$name" | cut -c1-"$keep" | sed 's#-*$##')-${hash}"
+    fi
+    printf '%s' "$name"
+}
+
 # a-z0-9 and underscores — safe as a database identifier.
 wtk_ident() {
     printf '%s' "$1" | sed 's#[^a-zA-Z0-9]#_#g' | tr '[:upper:]' '[:lower:]' \

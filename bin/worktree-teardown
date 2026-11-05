@@ -19,7 +19,7 @@ wtk_load_config "$main_root"
 
 workspace="$(wtk_workspace_name)"
 repo="$(basename "$main_root")"
-site_name="$(wtk_slug "${repo}-${workspace}")"
+site_name="$(wtk_site_name "$repo" "$workspace")"
 db_name="$(wtk_ident "${repo}_${workspace}")"
 
 # A name that came out empty would make the next lines operate on something
@@ -42,9 +42,13 @@ if [ "$site_tool" = auto ]; then
     fi
 fi
 if [ "$site_tool" != none ]; then
-    "$site_tool" unsecure  "$site_name" >/dev/null 2>&1 || true
-    "$site_tool" unisolate "$site_name" >/dev/null 2>&1 || true
-    "$site_tool" unlink    "$site_name" >/dev/null 2>&1 || true
+    # Worktrees set up before names were capped carry the full, untruncated one.
+    legacy_name="$(wtk_slug "${repo}-${workspace}")"
+    for name in "$site_name" $([ "$legacy_name" != "$site_name" ] && printf '%s' "$legacy_name"); do
+        "$site_tool" unsecure  "$name" >/dev/null 2>&1 || true
+        "$site_tool" unisolate "$name" >/dev/null 2>&1 || true
+        "$site_tool" unlink    "$name" >/dev/null 2>&1 || true
+    done
 fi
 
 # --- 2. Database ----------------------------------------------------------

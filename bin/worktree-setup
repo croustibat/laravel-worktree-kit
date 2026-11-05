@@ -20,7 +20,7 @@ wtk_load_config "$main_root"
 
 workspace="$(wtk_workspace_name)"
 repo="$(basename "$main_root")"
-site_name="$(wtk_slug "${repo}-${workspace}")"
+site_name="$(wtk_site_name "$repo" "$workspace")"
 db_name="$(wtk_ident "${repo}_${workspace}")"
 slot="$(wtk_port_slot "$site_name")"
 domain="${site_name}.${WTK_SITE_TLD:-test}"
